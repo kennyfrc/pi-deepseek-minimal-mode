@@ -1,0 +1,49 @@
+{
+  "name": "@kennyfrc/pi-deepseek-minimal-mode",
+  "version": "0.2.0",
+  "description": "DeepSeek Harness minimal preset for Pi: for DeepSeek-family models the wire payload becomes the RL-training environment (harness persona, exactly bash + str_replace_editor, wire params) with tool_search-based on-demand discovery of all other pi tools; AGENTS.md rides as a durable system_reminder, never the system prompt.",
+  "keywords": [
+    "pi-package",
+    "deepseek",
+    "minimal-mode",
+    "tool-search",
+    "rl-parity",
+    "reminders"
+  ],
+  "license": "MIT",
+  "author": "Kenn Costales",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kennyfrc/pi-deepseek-minimal-mode.git"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@kennyfrc/pi-system-reminders": "^0.2.0",
+    "@kennyfrc/pi-str-replace-editor": "^0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "vitest": "^3.2.4",
+    "@types/node": "^22.0.0",
+    "@earendil-works/pi-agent-core": "0.80.10",
+    "@earendil-works/pi-ai": "0.80.10",
+    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-tui": "0.80.10",
+    "typebox": "*"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
