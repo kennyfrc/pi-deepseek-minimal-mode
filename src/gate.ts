@@ -1,33 +1,16 @@
 /**
- * pi-deepseek-minimal-mode — model gating.
+ * Profile parsing and direct tool policy for DeepSeek minimal mode.
  *
- * Mirrors the DeepSeek Harness `minimal` preset: for DeepSeek-family models
- * (configurable), the model-facing toolset collapses to `bash`,
- * `str_replace_editor`, and `tool_search` — the discovery channel. Every
- * other pi tool (web_search, web_fetch, read/edit/write, grep/find/ls, …)
- * stays registered but out of the active set; the model finds and activates
- * them on demand through tool_search.
- *
- * Why (from the Chinese community analysis of DSH minimal mode): DeepSeek
- * models drift with many tools; a minimal set removes tool-choice ambiguity,
- * shrinks per-request payload (prefill is slow and cached-prefix-sensitive on
- * Chinese models), and the claude-code-style str_replace_editor is the surface
- * these models were tuned on. tool_search keeps the full toolbox one call away
- * without paying its context cost every request.
- *
- * Coexistence contract with pi-str-replace-editor:
- * - That extension owns {read, edit, write, grep, find, ls, str_replace_editor}.
- *   This gate never touches those names for deepseek (str-replace-editor's
- *   block messages are better), and it computes its desired set from the
- *   CURRENT active set, so the two extensions converge in any load order.
- * - For non-deepseek models (mode auto) this gate only removes tool_search; it
- *   restores nothing else, so pi-str-replace-editor's restore stands.
+ * Strict is the safe default. It exposes only the two tools in the reference
+ * Harness composition. Augmented adds registered tools named by `whitelist`.
+ * Every augmented tool is direct: there is no discovery state or hidden call
+ * path.
  */
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import { homedir } from "node:os";
+import { join } from "node:path";
 
-/** Minimal model shape the gate needs. Structurally compatible with pi's Model. */
+/** Minimal model fields used by this extension. */
 export interface GatableModel {
   id?: string;
   provider?: string;
@@ -36,121 +19,133 @@ export interface GatableModel {
 }
 
 export type FeatureMode = "auto" | "on" | "off";
+export type MinimalProfile = "strict" | "augmented";
 
-/** Default pattern: deepseek anywhere in id/provider/name, case-insensitive. */
 export const DEFAULT_DEEPSEEK_PATTERNS: readonly RegExp[] = [/deepseek/i];
-
-/**
- * The always-active core for a minimal model. tool_search stays in the
- * ACTIVE set so the runtime can route its calls, but it is never injected
- * in the provider payload (see WIRE_CORE_TOOLS): the model learns to call
- * it from the reminder text, not from a tool definition.
- */
-export const MINIMAL_CORE_TOOLS: readonly string[] = ["bash", "str_replace_editor", "tool_search"];
-
-/**
- * The only tools ever injected in the provider payload for a minimal model.
- * Discovered tools and tool_search are callable by name (they sit in the
- * active set) but stay out of the payload; the model learns their names and
- * argument shapes from the tool_search result text.
- */
-export const WIRE_CORE_TOOLS: readonly string[] = ["bash", "str_replace_editor"];
-
-/** The payload-visible set for a minimal model: wire core + whitelist. */
-export function wireAllowedTools(model: GatableModel | null | undefined): ReadonlySet<string> {
-  const { whitelist } = loadConfig();
-  return new Set([...WIRE_CORE_TOOLS, ...whitelist]);
-}
-
-/**
- * Extra tools kept in minimal mode. Default: none — the harness minimal
- * exposes ONLY bash + str_replace_editor in the payload. Whitelist tools
- * stay in the payload; everything else loads on demand via tool_search.
- */
 export const DEFAULT_WHITELIST: readonly string[] = [];
+export const MINIMAL_CORE_TOOLS: readonly string[] = ["bash", "str_replace_editor"];
 
 /**
- * Tool names owned by pi-str-replace-editor's tool_call blocking. This gate
- * does not block them (better messages exist there), but it DOES drop them
- * from the active set for minimal models.
+ * Sentinel in `whitelist` that expands to every registered tool except the
+ * core pair, the str_replace_editor-owned trio, and the GPT-only file tool.
+ * This makes a DeepSeek augmented session carry the same tool surface a
+ * normal (non-DeepSeek) session gets, minus the file-tool swaps applied for
+ * DeepSeek (pi-str-replace-editor replaces read/edit/write; pi-apply-patch is
+ * registered unconditionally but is GPT-family only).
  */
-export const STR_REPLACE_OWNED = ["read", "edit", "write", "grep", "find", "ls"] as const;
+export const WHITELIST_ALL_SENTINEL = "*";
+
+/** Names whose detailed block messages remain owned by pi-str-replace-editor. */
+export const STR_REPLACE_OWNED = ["read", "edit", "write"] as const;
+
+/**
+ * Tools registered unconditionally by another extension but owned by a
+ * different model family. pi-apply-patch keeps `apply_patch` active only for
+ * GPT-family models; it is registered for every model, so it must never
+ * surface in a DeepSeek augmented session even when explicit/all markers
+ * would include it.
+ */
+export const DEEPSEEK_EXCLUDED_TOOLS: readonly string[] = ["apply_patch"] as const;
 
 export interface MinimalModeConfig {
   mode: FeatureMode;
+  profile: MinimalProfile;
   deepseekPatterns: readonly RegExp[];
-  /** Extra tool names kept alongside the core set in minimal mode. */
+  /** Ordered names whose complete live schemas are inlined in augmented mode. */
   whitelist: readonly string[];
 }
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-deepseek-minimal-mode.json");
-const CONFIG_ALTERNATE = join(homedir(), ".pi", "agent", "pi-deepseek-minimal-mode.json");
+const EMPTY_NAMES: ReadonlySet<string> = new Set<string>();
 
 const DEFAULT_CONFIG: MinimalModeConfig = {
   mode: "auto",
+  profile: "strict",
   deepseekPatterns: DEFAULT_DEEPSEEK_PATTERNS,
   whitelist: DEFAULT_WHITELIST,
 };
 
 let cachedConfig: MinimalModeConfig | undefined;
-/** Test override; survives resetConfigCache and wins over the disk file. */
 let injectedConfig: MinimalModeConfig | null = null;
 
-/** Drop the DISK config cache so file edits apply at the next session_start. */
+function invariant(condition: unknown, message: string): asserts condition {
+  if (!condition) throw new Error(`pi-deepseek-minimal-mode invariant: ${message}`);
+}
+
+function assertConfig(config: MinimalModeConfig): void {
+  invariant(config.mode === "auto" || config.mode === "on" || config.mode === "off", "invalid mode");
+  invariant(config.profile === "strict" || config.profile === "augmented", "invalid profile");
+  invariant(config.deepseekPatterns.length > 0, "model pattern set must not be empty");
+  invariant(config.deepseekPatterns.every((pattern) => pattern instanceof RegExp), "model patterns must be RegExp values");
+  invariant(config.whitelist.every((name) => typeof name === "string"), "whitelist names must be strings");
+}
+
+/** Parse unknown config data into one valid, resolved policy. */
+export function parseMinimalModeConfig(raw: unknown): MinimalModeConfig {
+  const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const mode: FeatureMode =
+    record.mode === "on" || record.mode === "off" || record.mode === "auto" ? record.mode : DEFAULT_CONFIG.mode;
+  const profile: MinimalProfile = record.profile === "augmented" ? "augmented" : "strict";
+
+  let deepseekPatterns = DEFAULT_CONFIG.deepseekPatterns;
+  if (Array.isArray(record.deepseekPatterns) && record.deepseekPatterns.length > 0) {
+    const compiled: RegExp[] = [];
+    for (const value of record.deepseekPatterns) {
+      try {
+        compiled.push(new RegExp(String(value), "i"));
+      } catch {
+        // A malformed entry does not invalidate the whole config.
+      }
+    }
+    if (compiled.length > 0) deepseekPatterns = compiled;
+  }
+
+  const whitelist =
+    Array.isArray(record.whitelist) && record.whitelist.every((name) => typeof name === "string")
+      ? (record.whitelist as string[])
+      : DEFAULT_CONFIG.whitelist;
+
+  const config: MinimalModeConfig = { mode, profile, deepseekPatterns, whitelist };
+  assertConfig(config);
+  return config;
+}
+
+/** Drop the disk config cache so file edits apply on the next lifecycle read. */
 export function resetConfigCache(): void {
   if (injectedConfig === null) cachedConfig = undefined;
 }
 
 function readConfigFile(): MinimalModeConfig {
-  const path = existsSync(CONFIG_PATH) ? CONFIG_PATH : CONFIG_ALTERNATE;
+  if (!existsSync(CONFIG_PATH)) return parseMinimalModeConfig(undefined);
   try {
-    const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    const mode: FeatureMode =
-      raw.mode === "on" || raw.mode === "off" || raw.mode === "auto" ? raw.mode : DEFAULT_CONFIG.mode;
-    let patterns = DEFAULT_CONFIG.deepseekPatterns;
-    if (Array.isArray(raw.deepseekPatterns) && raw.deepseekPatterns.length > 0) {
-      const compiled: RegExp[] = [];
-      for (const p of raw.deepseekPatterns) {
-        try {
-          compiled.push(new RegExp(String(p), "i"));
-        } catch {
-          // Skip malformed patterns instead of failing the gate.
-        }
-      }
-      if (compiled.length > 0) patterns = compiled;
-    }
-    let whitelist = DEFAULT_CONFIG.whitelist;
-    if (Array.isArray(raw.whitelist) && raw.whitelist.every((w) => typeof w === "string")) {
-      whitelist = raw.whitelist as string[];
-    }
-    return { mode, deepseekPatterns: patterns, whitelist };
+    return parseMinimalModeConfig(JSON.parse(readFileSync(CONFIG_PATH, "utf8")));
   } catch {
-    return DEFAULT_CONFIG;
+    return parseMinimalModeConfig(undefined);
   }
 }
 
 export function loadConfig(): MinimalModeConfig {
   if (injectedConfig) return injectedConfig;
   if (!cachedConfig) cachedConfig = readConfigFile();
+  assertConfig(cachedConfig);
   return cachedConfig;
 }
 
 /** Test-only config injection. */
 export function _setConfigForTesting(config: MinimalModeConfig | null): void {
+  if (config) assertConfig(config);
   injectedConfig = config;
   cachedConfig = config ?? undefined;
 }
 
 export function isDeepSeekModel(model: GatableModel | null | undefined): boolean {
   if (!model) return false;
-  const { deepseekPatterns } = loadConfig();
   const haystacks = [model.id, model.provider, model.name].filter(
     (value): value is string => typeof value === "string" && value.length > 0,
   );
-  return deepseekPatterns.some((pattern) => haystacks.some((h) => pattern.test(h)));
+  return loadConfig().deepseekPatterns.some((pattern) => haystacks.some((value) => pattern.test(value)));
 }
 
-/** Whether minimal mode applies to this model right now. */
 export function isMinimalActive(model: GatableModel | null | undefined): boolean {
   const { mode } = loadConfig();
   if (mode === "off") return false;
@@ -158,76 +153,78 @@ export function isMinimalActive(model: GatableModel | null | undefined): boolean
   return isDeepSeekModel(model);
 }
 
-/**
- * The full allowed set for a minimal model: active-set core + whitelist +
- * tools discovered via tool_search (they load on demand and must survive
- * the gate's sweeps).
- */
-export function allowedTools(model: GatableModel, discovered?: ReadonlySet<string>): ReadonlySet<string> {
-  const { whitelist } = loadConfig();
-  const set = new Set<string>([...MINIMAL_CORE_TOOLS, ...whitelist]);
-  for (const name of discovered ?? []) set.add(name);
-  return set;
+/** Unique registered augmented extras in config order. */
+export function registeredWhitelistTools(
+  config: MinimalModeConfig,
+  registeredNames: ReadonlySet<string>,
+): string[] {
+  assertConfig(config);
+  if (config.profile === "strict") return [];
+
+  const core = new Set<string>(MINIMAL_CORE_TOOLS);
+  const swapOwned = new Set<string>(STR_REPLACE_OWNED);
+  const deepseekExcluded = new Set<string>(DEEPSEEK_EXCLUDED_TOOLS);
+  const seen = new Set<string>();
+  const extras: string[] = [];
+  const push = (name: string): void => {
+    if (core.has(name) || swapOwned.has(name) || deepseekExcluded.has(name) || seen.has(name) || !registeredNames.has(name))
+      return;
+    seen.add(name);
+    extras.push(name);
+  };
+  for (const name of config.whitelist) {
+    if (name === WHITELIST_ALL_SENTINEL) {
+      for (const registered of registeredNames) push(registered);
+      continue;
+    }
+    push(name);
+  }
+  invariant(new Set(extras).size === extras.length, "augmented extra tools must be unique");
+  return extras;
 }
 
-/** The tool_search name, owned by this gate outside minimal mode. */
-export const TOOL_SEARCH_OWNED_NAME = "tool_search";
+/** Direct callable names for the selected profile. */
+export function allowedTools(
+  model: GatableModel,
+  registeredNames: ReadonlySet<string> = EMPTY_NAMES,
+): ReadonlySet<string> {
+  const config = loadConfig();
+  const names = [...MINIMAL_CORE_TOOLS, ...registeredWhitelistTools(config, registeredNames)];
+  invariant(!names.some((name, index) => names.indexOf(name) !== index), "allowed tools must be unique");
+  return new Set(names);
+}
 
 /**
- * Compute the desired active set. Returns null when nothing should change.
+ * Compute the complete active set owned by this profile.
  *
- * - mode off: inert.
- * - minimal model: keep only allowed tools that are already active, then
- *   ensure the core tools (bash, str_replace_editor, tool_search) are
- *   present — they are always registered while this extension is installed
- *   together with pi-str-replace-editor. Whitelist tools are kept only when
- *   already active (never force-added, so a disabled package stays disabled).
- * - non-minimal model: remove tool_search, touch nothing else.
+ * Augmented force-adds registered whitelist names. This repairs names removed
+ * by an earlier lifecycle gate and picks up late registrations on the next
+ * turn_start or context sweep.
  */
 export function desiredActiveTools(
   model: GatableModel | null | undefined,
   currentActive: readonly string[],
-  discovered?: ReadonlySet<string>,
+  registeredNames: ReadonlySet<string> = EMPTY_NAMES,
 ): string[] | null {
-  if (loadConfig().mode === "off") return null;
+  if (loadConfig().mode === "off" || !isMinimalActive(model)) return null;
 
-  if (isMinimalActive(model)) {
-    const allowed = allowedTools(model ?? {}, discovered);
-    const next = currentActive.filter((name) => allowed.has(name));
-    for (const core of MINIMAL_CORE_TOOLS) {
-      if (!next.includes(core)) next.push(core);
-    }
-    return sortedEquals(next, currentActive) ? null : next;
-  }
-
-  // Non-minimal: this gate only owns its discovery tool (tool_search);
-  // everything else stays.
-  const managed = [TOOL_SEARCH_OWNED_NAME];
-  if (!currentActive.some((name) => managed.includes(name))) return null;
-  const next = currentActive.filter((name) => !managed.includes(name));
-  return sortedEquals(next, currentActive) ? null : next;
+  const next = [...allowedTools(model ?? {}, registeredNames)];
+  invariant(next[0] === "bash" && next[1] === "str_replace_editor", "core tool order changed");
+  invariant(!next.includes("tool_search"), "discovery tool entered the direct surface");
+  return orderedEquals(next, currentActive) ? null : next;
 }
 
-/**
- * Defense-in-depth blocking. Never blocks the names owned by
- * pi-str-replace-editor (read/edit/write/grep/find/ls) — its block messages
- * are better; the active-set swap above still removes them for minimal models.
- */
+/** Defense-in-depth block policy for calls outside the selected direct set. */
 export function shouldBlockTool(
   toolName: string,
   model: GatableModel | null | undefined,
-  discovered?: ReadonlySet<string>,
+  registeredNames: ReadonlySet<string> = EMPTY_NAMES,
 ): boolean {
-  if (loadConfig().mode === "off") return false;
-  if (!isMinimalActive(model)) {
-    return toolName === TOOL_SEARCH_OWNED_NAME;
-  }
+  if (loadConfig().mode === "off" || !isMinimalActive(model)) return false;
   if (STR_REPLACE_OWNED.includes(toolName as (typeof STR_REPLACE_OWNED)[number])) return false;
-  return !allowedTools(model ?? {}, discovered).has(toolName);
+  return !allowedTools(model ?? {}, registeredNames).has(toolName);
 }
 
-function sortedEquals(next: string[], current: readonly string[]): boolean {
-  const nextSorted = [...next].sort().join("\0");
-  const currentSorted = [...current].sort().join("\0");
-  return nextSorted === currentSorted;
+function orderedEquals(next: readonly string[], current: readonly string[]): boolean {
+  return next.length === current.length && next.every((name, index) => current[index] === name);
 }

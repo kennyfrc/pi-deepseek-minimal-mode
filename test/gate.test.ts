@@ -1,188 +1,205 @@
-/**
- * Gate tests: deepseek detection, minimal active set computation,
- * tool_search-only ownership for non-minimal models, and the blocking matrix.
- */
 import { afterEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_DEEPSEEK_PATTERNS,
-  DEFAULT_WHITELIST,
   MINIMAL_CORE_TOOLS,
+  WHITELIST_ALL_SENTINEL,
+  allowedTools,
   desiredActiveTools,
   isDeepSeekModel,
   isMinimalActive,
+  parseMinimalModeConfig,
+  registeredWhitelistTools,
   shouldBlockTool,
   _setConfigForTesting,
   type GatableModel,
+  type MinimalModeConfig,
 } from "../src/gate.js";
 
 afterEach(() => {
   _setConfigForTesting(null);
 });
 
-const FULL_ACTIVE = [
-  "bash",
-  "read",
-  "edit",
-  "write",
-  "grep",
-  "find",
-  "ls",
-  "web_search",
-  "web_fetch",
-  "cdp",
-  "flows",
-  "ask_user",
-  "todo",
-  "memo",
-  "str_replace_editor",
-  "some_extension_tool",
-];
+function config(overrides: Partial<MinimalModeConfig> = {}): MinimalModeConfig {
+  return {
+    mode: "auto",
+    profile: "strict",
+    deepseekPatterns: DEFAULT_DEEPSEEK_PATTERNS,
+    whitelist: [],
+    ...overrides,
+  };
+}
 
 function model(overrides: Partial<GatableModel> = {}): GatableModel {
   return { id: "glm-5.2-short", provider: "neuralwatt", api: "openai-completions", ...overrides };
 }
 
-describe("isDeepSeekModel", () => {
-  it("matches deepseek in id, provider, or name, case-insensitively", () => {
-    expect(isDeepSeekModel(model({ id: "deepseek-v4-flash" }))).toBe(true);
-    expect(isDeepSeekModel(model({ id: "DeepSeek-V4-Pro" }))).toBe(true);
-    expect(isDeepSeekModel(model({ provider: "deepseek", id: "v4" }))).toBe(true);
-    expect(isDeepSeekModel(model({ id: "x", name: "DeepSeek V4 Flash" }))).toBe(true);
+const deepseek = model({ id: "deepseek-v4-flash" });
+
+describe("config parsing", () => {
+  it("defaults missing and invalid profiles to strict", () => {
+    expect(parseMinimalModeConfig(undefined).profile).toBe("strict");
+    expect(parseMinimalModeConfig({ profile: "legacy" }).profile).toBe("strict");
   });
 
-  it("rejects unrelated models and missing models", () => {
+  it("accepts augmented and preserves whitelist order", () => {
+    const parsed = parseMinimalModeConfig({ profile: "augmented", whitelist: ["todo", "ask_user", "todo"] });
+    expect(parsed.profile).toBe("augmented");
+    expect(parsed.whitelist).toEqual(["todo", "ask_user", "todo"]);
+  });
+
+  it("preserves existing mode and model-pattern parsing", () => {
+    const parsed = parseMinimalModeConfig({ mode: "on", deepseekPatterns: ["^ds-", "["] });
+    expect(parsed.mode).toBe("on");
+    expect(parsed.deepseekPatterns).toHaveLength(1);
+    expect(parsed.deepseekPatterns[0].test("DS-model")).toBe(true);
+  });
+});
+
+describe("model matching", () => {
+  it("matches deepseek in id, provider, or name", () => {
+    expect(isDeepSeekModel(deepseek)).toBe(true);
+    expect(isDeepSeekModel(model({ provider: "deepseek", id: "v4" }))).toBe(true);
+    expect(isDeepSeekModel(model({ id: "x", name: "DeepSeek V4" }))).toBe(true);
     expect(isDeepSeekModel(model())).toBe(false);
     expect(isDeepSeekModel(undefined)).toBe(false);
-    expect(isDeepSeekModel(null)).toBe(false);
   });
 
-  it("uses configured patterns instead of the default when provided", () => {
-    _setConfigForTesting({ mode: "auto", deepseekPatterns: [/^ds-/i], whitelist: DEFAULT_WHITELIST });
-    expect(isDeepSeekModel(model({ id: "ds-r1-0528" }))).toBe(true);
-    expect(isDeepSeekModel(model({ id: "deepseek-v4-flash" }))).toBe(false);
-  });
-});
-
-describe("isMinimalActive", () => {
-  it("auto: active only for deepseek", () => {
-    _setConfigForTesting({ mode: "auto", deepseekPatterns: DEFAULT_DEEPSEEK_PATTERNS, whitelist: DEFAULT_WHITELIST });
-    expect(isMinimalActive(model({ id: "deepseek-v4-flash" }))).toBe(true);
+  it("respects auto, on, and off", () => {
+    _setConfigForTesting(config());
+    expect(isMinimalActive(deepseek)).toBe(true);
     expect(isMinimalActive(model())).toBe(false);
-  });
-
-  it("on: active for every model; off: active for none", () => {
-    _setConfigForTesting({ mode: "on", deepseekPatterns: DEFAULT_DEEPSEEK_PATTERNS, whitelist: DEFAULT_WHITELIST });
+    _setConfigForTesting(config({ mode: "on" }));
     expect(isMinimalActive(model())).toBe(true);
-    _setConfigForTesting({ mode: "off", deepseekPatterns: DEFAULT_DEEPSEEK_PATTERNS, whitelist: DEFAULT_WHITELIST });
-    expect(isMinimalActive(model({ id: "deepseek-v4-flash" }))).toBe(false);
+    _setConfigForTesting(config({ mode: "off" }));
+    expect(isMinimalActive(deepseek)).toBe(false);
   });
 });
 
-describe("desiredActiveTools", () => {
-  it("deepseek: collapses the set to core tools + whitelist, preserves nothing else", () => {
-    const next = desiredActiveTools(model({ id: "deepseek-v4-flash" }), FULL_ACTIVE);
-    // Exactly the harness minimal pair plus the tool_search discovery channel.
-    expect([...next!].sort()).toEqual([...MINIMAL_CORE_TOOLS].sort());
-    expect(next).not.toContain("read");
-    expect(next).not.toContain("web_fetch");
-    expect(next).not.toContain("cdp");
-    expect(next).not.toContain("ask_user");
-  });
-
-  it("deepseek: whitelist tools are kept only when already active (never force-added)", () => {
-    const next = desiredActiveTools(model({ id: "deepseek-v4-flash" }), [
+describe("direct active-tool policy", () => {
+  it("strict always resolves to the Harness pair in Harness order", () => {
+    _setConfigForTesting(config({ whitelist: ["ask_user"] }));
+    expect(desiredActiveTools(deepseek, ["ask_user", "bash"], new Set(["ask_user"]))).toEqual([
       "bash",
       "str_replace_editor",
-      "tool_search",
-      "some_extension_tool",
     ]);
-    // Not whitelisted by default -> dropped.
-    expect(next).toEqual(["bash", "str_replace_editor", "tool_search"]);
+    expect(desiredActiveTools(deepseek, [...MINIMAL_CORE_TOOLS], new Set(["ask_user"]))).toBeNull();
   });
 
-  it("deepseek: ensures the core tools are present even when missing from the active set", () => {
-    const next = desiredActiveTools(model({ id: "deepseek-v4-flash" }), ["bash"]);
-    expect(next).toEqual(["bash", "str_replace_editor", "tool_search"]);
-  });
-
-  it("non-deepseek: removes tool_search, touches nothing else", () => {
-    const next = desiredActiveTools(model(), ["bash", "read", "edit", "write", "tool_search", "cdp"]);
-    expect(next).toEqual(["bash", "read", "edit", "write", "cdp"]);
-  });
-
-  it("non-deepseek without the discovery tools: no-op (null)", () => {
-    expect(desiredActiveTools(model(), ["bash", "read", "edit", "write", "cdp"])).toBeNull();
-  });
-
-  it("mode off: inert", () => {
-    _setConfigForTesting({ mode: "off", deepseekPatterns: DEFAULT_DEEPSEEK_PATTERNS, whitelist: DEFAULT_WHITELIST });
-    expect(desiredActiveTools(model({ id: "deepseek-v4-flash" }), FULL_ACTIVE)).toBeNull();
-    expect(desiredActiveTools(model(), ["bash", "tool_search"])).toBeNull();
-  });
-
-  it("is idempotent: returns null when the set is already correct", () => {
-    expect(desiredActiveTools(model({ id: "deepseek-v4-flash" }), [...MINIMAL_CORE_TOOLS])).toBeNull();
-    expect(desiredActiveTools(model(), ["bash", "read"])).toBeNull();
-  });
-
-  it("custom whitelist keeps extra tools for deepseek (e.g. always-on web_search)", () => {
-    _setConfigForTesting({
-      mode: "auto",
-      deepseekPatterns: DEFAULT_DEEPSEEK_PATTERNS,
-      whitelist: ["cdp", "web_search"],
+  it("augmented force-adds unique registered whitelist tools in config order", () => {
+    const augmented = config({
+      profile: "augmented",
+      whitelist: ["todo", "bash", "ask_user", "todo", "missing"],
     });
-    const next = desiredActiveTools(model({ id: "deepseek-v4-flash" }), ["bash", "cdp", "web_search", "web_fetch"]);
-    expect([...next!].sort()).toEqual(["bash", "cdp", "str_replace_editor", "tool_search", "web_search"].sort());
-  });
-
-  it("tools discovered via tool_search survive the gate", () => {
-    const discovered = new Set(["web_search", "web_fetch"]);
-    const next = desiredActiveTools(model({ id: "deepseek-v4-flash" }), [
+    _setConfigForTesting(augmented);
+    const registered = new Set(["bash", "str_replace_editor", "ask_user", "todo"]);
+    expect(registeredWhitelistTools(augmented, registered)).toEqual(["todo", "ask_user"]);
+    expect(desiredActiveTools(deepseek, ["bash"], registered)).toEqual([
       "bash",
       "str_replace_editor",
-      "tool_search",
-      "web_search",
-      "web_fetch",
-      "cdp",
-    ], discovered);
-    expect([...next!].sort()).toEqual(["bash", "str_replace_editor", "tool_search", "web_fetch", "web_search"].sort());
-    // Idempotent with the discovered set present.
-    expect(desiredActiveTools(model({ id: "deepseek-v4-flash" }), next!, discovered)).toBeNull();
+      "todo",
+      "ask_user",
+    ]);
+    expect([...allowedTools(deepseek, registered)]).toEqual([
+      "bash",
+      "str_replace_editor",
+      "todo",
+      "ask_user",
+    ]);
+  });
+
+  it("expands the all-tools sentinel to every registered non-core, non-swap tool", () => {
+    _setConfigForTesting(config({ profile: "augmented", whitelist: [WHITELIST_ALL_SENTINEL] }));
+    const registered = new Set([
+      "bash",
+      "str_replace_editor",
+      "read",
+      "edit",
+      "write",
+      "grep",
+      "apply_patch",
+      "ask_user",
+      "todo",
+      "memo",
+    ]);
+    expect(registeredWhitelistTools(config({ profile: "augmented", whitelist: [WHITELIST_ALL_SENTINEL] }), registered)).toEqual(
+      ["grep", "ask_user", "todo", "memo"],
+    );
+    expect([...allowedTools(deepseek, registered)]).toEqual([
+      "bash",
+      "str_replace_editor",
+      "grep",
+      "ask_user",
+      "todo",
+      "memo",
+    ]);
+  });
+
+  it("never surfaces the GPT-only apply_patch even when whitelisted explicitly", () => {
+    _setConfigForTesting(config({ profile: "augmented", whitelist: ["apply_patch", "ask_user"] }));
+    const registered = new Set(["bash", "str_replace_editor", "apply_patch", "ask_user"]);
+    expect(registeredWhitelistTools(config({ profile: "augmented", whitelist: ["apply_patch", "ask_user"] }), registered)).toEqual(
+      ["ask_user"],
+    );
+    expect([...allowedTools(deepseek, registered)]).toEqual(["bash", "str_replace_editor", "ask_user"]);
+    expect(shouldBlockTool("apply_patch", deepseek, registered)).toBe(true);
+    expect(shouldBlockTool("ask_user", deepseek, registered)).toBe(false);
+  });
+
+  it("mixes the sentinel with explicit names without duplication", () => {
+    _setConfigForTesting(config({ profile: "augmented", whitelist: ["ask_user", WHITELIST_ALL_SENTINEL] }));
+    const registered = new Set(["bash", "str_replace_editor", "read", "ask_user", "todo"]);
+    expect(registeredWhitelistTools(config({ profile: "augmented", whitelist: ["ask_user", WHITELIST_ALL_SENTINEL] }), registered)).toEqual(
+      ["ask_user", "todo"],
+    );
+  });
+
+  it("restores a registered extra removed by an earlier gate", () => {
+    _setConfigForTesting(config({ profile: "augmented", whitelist: ["grep"] }));
+    expect(desiredActiveTools(deepseek, ["bash", "str_replace_editor"], new Set(["grep"]))).toEqual([
+      "bash",
+      "str_replace_editor",
+      "grep",
+    ]);
+  });
+
+  it("omits unavailable extras and is idempotent in order", () => {
+    _setConfigForTesting(config({ profile: "augmented", whitelist: ["todo", "missing"] }));
+    const registered = new Set(["todo"]);
+    const expected = ["bash", "str_replace_editor", "todo"];
+    expect(desiredActiveTools(deepseek, expected, registered)).toBeNull();
+    expect(desiredActiveTools(deepseek, ["todo", "bash", "str_replace_editor"], registered)).toEqual(expected);
+  });
+
+  it("is inert for non-minimal models and mode off", () => {
+    expect(desiredActiveTools(model(), ["bash", "read", "tool_search"], new Set())).toBeNull();
+    _setConfigForTesting(config({ mode: "off" }));
+    expect(desiredActiveTools(deepseek, ["bash"], new Set())).toBeNull();
   });
 });
 
-describe("blocking matrix", () => {
-  it("minimal model: blocks everything outside the allowed set, never read/edit/write/grep/find/ls", () => {
-    const deepseek = model({ id: "deepseek-v4-flash" });
-    expect(shouldBlockTool("web_fetch", deepseek)).toBe(true);
-    expect(shouldBlockTool("cdp", deepseek)).toBe(true);
-    expect(shouldBlockTool("flows", deepseek)).toBe(true);
-    expect(shouldBlockTool("web_search", deepseek)).toBe(true); // hidden until discovered
-    expect(shouldBlockTool("ask_user", deepseek)).toBe(true);
+describe("blocking policy", () => {
+  it("strict blocks names outside the pair and delegates editor-owned names", () => {
+    _setConfigForTesting(config());
     expect(shouldBlockTool("bash", deepseek)).toBe(false);
     expect(shouldBlockTool("str_replace_editor", deepseek)).toBe(false);
-    expect(shouldBlockTool("tool_search", deepseek)).toBe(false);
-    // Discovered tools are not blocked.
-    expect(shouldBlockTool("web_fetch", deepseek, new Set(["web_fetch"]))).toBe(false);
-    // Owned by pi-str-replace-editor's blocks with better messages.
+    expect(shouldBlockTool("ask_user", deepseek)).toBe(true);
     expect(shouldBlockTool("read", deepseek)).toBe(false);
-    expect(shouldBlockTool("edit", deepseek)).toBe(false);
-    expect(shouldBlockTool("write", deepseek)).toBe(false);
-    expect(shouldBlockTool("grep", deepseek)).toBe(false);
-    expect(shouldBlockTool("find", deepseek)).toBe(false);
-    expect(shouldBlockTool("ls", deepseek)).toBe(false);
+    expect(shouldBlockTool("grep", deepseek)).toBe(true);
+    expect(shouldBlockTool("find", deepseek)).toBe(true);
+    expect(shouldBlockTool("ls", deepseek)).toBe(true);
   });
 
-  it("non-minimal model: blocks tool_search only", () => {
-    const glm = model();
-    expect(shouldBlockTool("tool_search", glm)).toBe(true);
-    expect(shouldBlockTool("web_fetch", glm)).toBe(false);
-    expect(shouldBlockTool("cdp", glm)).toBe(false);
+  it("augmented allows registered whitelist names only", () => {
+    _setConfigForTesting(config({ profile: "augmented", whitelist: ["ask_user", "todo"] }));
+    const registered = new Set(["ask_user"]);
+    expect(shouldBlockTool("ask_user", deepseek, registered)).toBe(false);
+    expect(shouldBlockTool("todo", deepseek, registered)).toBe(true);
+    expect(shouldBlockTool("web_fetch", deepseek, registered)).toBe(true);
   });
 
-  it("mode off: blocks nothing", () => {
-    _setConfigForTesting({ mode: "off", deepseekPatterns: DEFAULT_DEEPSEEK_PATTERNS, whitelist: DEFAULT_WHITELIST });
-    expect(shouldBlockTool("cdp", model({ id: "deepseek-v4-flash" }))).toBe(false);
+  it("does not own calls for non-minimal models or mode off", () => {
     expect(shouldBlockTool("tool_search", model())).toBe(false);
+    _setConfigForTesting(config({ mode: "off" }));
+    expect(shouldBlockTool("ask_user", deepseek)).toBe(false);
   });
 });
