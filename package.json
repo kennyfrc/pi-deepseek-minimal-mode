@@ -1,6 +1,6 @@
 {
   "name": "@kennyfrc/pi-deepseek-minimal-mode",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Strict-by-default DeepSeek Harness composition for Pi, with an opt-in augmented profile that inlines configured extra tool definitions and durable AGENTS context.",
   "keywords": [
     "pi-package",
